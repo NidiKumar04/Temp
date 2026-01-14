@@ -56,7 +56,7 @@ PARAM
     [string]$DefaultPwd = "TEST1234",
 
     [Parameter(Mandatory=$false, Position=2)]
-    [string]$OldPwd = "B787A380dc10"
+    [string]$OldPwd = "B787A380dc10" #B787A380dc10
 )
 
 BEGIN
@@ -114,9 +114,10 @@ PROCESS
     {
         #region DATA PREPARATION
 
-        Write-Log -Message "Loading general script extensions from <$($Script:ModulesPath)>" -Type 1 -Info $MyInvocation
         . "$(Join-Path $Script:ModulesPath 'Common.ps1')"
         . "$(Join-Path $Script:ModulesPath 'BitLocker.ps1')"
+
+        Write-Log -Message "Loading general script extensions from <$($Script:ModulesPath)>" -Type 1 -Info $MyInvocation
 
         Write-Log -Message "Initializing the script execution (Phase: $($Phase))" -Type 1 -Info $MyInvocation
         Write-Log -Message "Modules path <$($Script:ModulesPath)>" -Type 1 -Info $MyInvocation
