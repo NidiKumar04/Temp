@@ -53,18 +53,16 @@ PARAM
     [string]$Phase,
 
     [Parameter(Mandatory=$false, Position=1)]
-    [string]$DefaultPwd = "TEST1234",
+    [string]$DefaultPwd = "B787A380dc10",
 
     [Parameter(Mandatory=$false, Position=2)]
-    [string]$OldPwd = "B787A380dc10" #B787A380dc10
+    [string]$OldPwd = "B787A380dc10"
 )
 
 BEGIN
 {
     #region VARIABLE DECLARATION
     
-    #Write-Log -Message "Initializing the script execution (Phase: $($Phase))" -Type 1 -Info $MyInvocation
-
     #region --- Script Basics
 
     [string]$Script:ScriptPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -74,17 +72,14 @@ BEGIN
 
 
     [string]$Script:SupportPath = Join-Path $Script:ScriptPath "support"
-    #Write-Log -Message "Support path <$($Script:SupportPath)>" -Type 1 -Info $MyInvocation
 
     [string]$Script:SettingsPath = Join-Path $Script:ScriptPath "settings"
-    #Write-Log -Message "Settings path <$($Script:SettingsPath)>" -Type 1 -Info $MyInvocation
 
     if (-not $Global:LogFile) {
     $Global:LogFile = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\BIOS_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     }
 
     [string]$Script:LogPath = [System.IO.Path]::GetDirectoryName($Global:LogFile)
-    #Write-Log -Message "Log path <$($Script:LogPath)>" -Type 1 -Info $MyInvocation
 
     [string]$Script:PreConfigSnapshot = Join-Path $Script:LogPath "PreConfigSnapshot.txt"
 	[string]$Script:PostConfigSnapshot = Join-Path $Script:LogPath "PostConfigSnapshot.txt"
@@ -116,6 +111,40 @@ PROCESS
 
         . "$(Join-Path $Script:ModulesPath 'Common.ps1')"
         . "$(Join-Path $Script:ModulesPath 'BitLocker.ps1')"
+
+        #region REGISTRY STATE MACHINE INIT
+
+        $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+        if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+        $CurrentBootTime = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime.ToString("yyyy-MM-dd HH:mm:ss")
+        
+        $BIOSPasswordSet = Get-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty BIOSPasswordSet
+        $BIOSSettingsApplied = Get-ItemProperty -Path $RegPath -Name "BIOSSettingsApplied" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty BIOSSettingsApplied
+        $PasswordFailed = Get-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PasswordFailed
+        $LastRebootTime = Get-ItemProperty -Path $RegPath -Name "LastRebootTime" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LastRebootTime
+
+        if ($BIOSPasswordSet -eq 1 -and $BIOSSettingsApplied -eq 1) {
+            Write-Log -Message "BIOS password and settings already applied successfully. Exiting." -Type 1 -Info $MyInvocation
+            exit $Script:ERR_SUCCESS
+        }
+
+        if ($PasswordFailed -eq 1) {
+            if ($LastRebootTime -eq $CurrentBootTime) {
+                Write-Log -Message "Password failed in current boot session. Waiting for reboot." -Type 2 -Info $MyInvocation
+                exit $Script:ERR_SUCCESS
+            } else {
+                Write-Log -Message "New boot detected after password failure. Retrying password change..." -Type 1 -Info $MyInvocation
+                Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
+                Set-ItemProperty -Path $RegPath -Name "LastRebootTime" -Value $CurrentBootTime -Type String
+            }
+        }
+
+        if (!$LastRebootTime -or $LastRebootTime -ne $CurrentBootTime) {
+            Set-ItemProperty -Path $RegPath -Name "LastRebootTime" -Value $CurrentBootTime -Type String
+        }
+
+        #endregion REGISTRY STATE MACHINE INIT
 
         Write-Log -Message "Loading general script extensions from <$($Script:ModulesPath)>" -Type 1 -Info $MyInvocation
 
@@ -230,16 +259,31 @@ PROCESS
                 #region --- Set BIOS Password
 
                 if ($Phase -ne "WIN") {
-                    if (!($DeviceInfo.Model -match "Precision Rack 7910") -and !($DeviceInfo.Model -match "Precision 7920 Rack"))
-                    {
-				        Write-Log -Message "Try to set the default BIOS password." -Type 1 -Info $MyInvocation
-				        $RtnSetPassword = Set-BiosPassword -Executable $DellConfigExecutable -OldPasswords $OldPwd -NewPassword $DefaultPwd
-				
-				        if ($RtnSetPassword.IsError) {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 2 -Info $MyInvocation
+
+                $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+                if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+                    Write-Log -Message "Checking BIOS password state..." -Type 1 -Info $MyInvocation
+    
+                    $TestAuth = Set-BiosPassword -OldPasswords $DefaultPwd -NewPassword $DefaultPwd
+    
+                    if ($TestAuth.IsError) {
+                        Write-Log -Message "Current password is OldPwd, changing to DefaultPwd..." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
+        
+                        if ($RtnSetPassword.IsError) {
+                            Write-Log -Message "The PW is Unknown so could not change" -Type 2 -Info $MyInvocation
+                            Set-ItemProperty -Path $RegPath -Name "PasswordFailed" -Value 1 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -Value 0 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String
+                            exit $Script:ERR_SUCCESS
                         } else {
-                            Write-Log -Message $RtnSetPassword.LogEntry -Type 1 -Info $MyInvocation
+                            Write-Log -Message "Successfully changed the BIOS/UEFI password." -Type 1 -Info $MyInvocation
+                            Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
                         }
+                    } else {
+                        Write-Log -Message "BIOS password already set correctly - no changes needed." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = $TestAuth
                     }
                 }
 
@@ -323,13 +367,31 @@ PROCESS
                 #region --- Set BIOS Password
 
                 if ($Phase -ne "WIN") {
-				    Write-Log -Message "Try to set the default BIOS password." -Type 1 -Info $MyInvocation
-				    $RtnSetPassword = Set-BiosPassword -Executable $ExtraComputerConfigExecutable -OldPasswords $OldPwd -NewPassword $DefaultPwd
-				
-				    if ($RtnSetPassword.IsError) {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 2 -Info $MyInvocation
+
+                $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+                if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+                    Write-Log -Message "Checking BIOS password state..." -Type 1 -Info $MyInvocation
+    
+                    $TestAuth = Set-BiosPassword -OldPasswords $DefaultPwd -NewPassword $DefaultPwd
+    
+                    if ($TestAuth.IsError) {
+                        Write-Log -Message "Current password is OldPwd, changing to DefaultPwd..." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
+        
+                        if ($RtnSetPassword.IsError) {
+                            Write-Log -Message "The PW is Unknown so could not change" -Type 2 -Info $MyInvocation
+                            Set-ItemProperty -Path $RegPath -Name "PasswordFailed" -Value 1 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -Value 0 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String
+                            exit $Script:ERR_SUCCESS
+                        } else {
+                            Write-Log -Message "Successfully changed the BIOS/UEFI password." -Type 1 -Info $MyInvocation
+                            Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
+                        }
                     } else {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 1 -Info $MyInvocation
+                        Write-Log -Message "BIOS password already set correctly - no changes needed." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = $TestAuth
                     }
                 }
 
@@ -393,13 +455,31 @@ PROCESS
                 #region --- Set BIOS Password
 
                 if ($Phase -ne "WIN") {
-                    Write-Log -Message "Try to set the default BIOS password." -Type 1 -Info $MyInvocation
-				    $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
 
-				    if ($RtnSetPassword.IsError) {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 2 -Info $MyInvocation
+                $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+                if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+                    Write-Log -Message "Checking BIOS password state..." -Type 1 -Info $MyInvocation
+    
+                    $TestAuth = Set-BiosPassword -OldPasswords $DefaultPwd -NewPassword $DefaultPwd
+    
+                    if ($TestAuth.IsError) {
+                        Write-Log -Message "Current password is OldPwd, changing to DefaultPwd..." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
+        
+                        if ($RtnSetPassword.IsError) {
+                            Write-Log -Message "The PW is Unknown so could not change" -Type 2 -Info $MyInvocation
+                            Set-ItemProperty -Path $RegPath -Name "PasswordFailed" -Value 1 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -Value 0 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String
+                            exit $Script:ERR_SUCCESS
+                        } else {
+                            Write-Log -Message "Successfully changed the BIOS/UEFI password." -Type 1 -Info $MyInvocation
+                            Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
+                        }
                     } else {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 1 -Info $MyInvocation
+                        Write-Log -Message "BIOS password already set correctly - no changes needed." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = $TestAuth
                     }
                 }
 
@@ -491,13 +571,31 @@ PROCESS
                 #region --- Set BIOS Password
 
                 if ($Phase -ne "WIN") {
-                    Write-Log -Message "Try to set the default BIOS password." -Type 1 -Info $MyInvocation
-                    $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
 
-                    if ($RtnSetPassword.IsError) {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 2 -Info $MyInvocation
+                $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+                if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+                    Write-Log -Message "Checking BIOS password state..." -Type 1 -Info $MyInvocation
+    
+                    $TestAuth = Set-BiosPassword -OldPasswords $DefaultPwd -NewPassword $DefaultPwd
+    
+                    if ($TestAuth.IsError) {
+                        Write-Log -Message "Current password is OldPwd, changing to DefaultPwd..." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
+        
+                        if ($RtnSetPassword.IsError) {
+                            Write-Log -Message "The PW is Unknown so could not change" -Type 2 -Info $MyInvocation
+                            Set-ItemProperty -Path $RegPath -Name "PasswordFailed" -Value 1 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -Value 0 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String
+                            exit $Script:ERR_SUCCESS
+                        } else {
+                            Write-Log -Message "Successfully changed the BIOS/UEFI password." -Type 1 -Info $MyInvocation
+                            Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
+                        }
                     } else {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 1 -Info $MyInvocation
+                        Write-Log -Message "BIOS password already set correctly - no changes needed." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = $TestAuth
                     }
                 }
 
@@ -634,13 +732,31 @@ PROCESS
                 #region --- Set BIOS Password
 
                 if ($Phase -ne "WIN") {
-                    Write-Log -Message "Try to set the default BIOS password." -Type 1 -Info $MyInvocation
-                    $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
 
-                    if ($RtnSetPassword.IsError) {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 2 -Info $MyInvocation
+                $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+                if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+                    Write-Log -Message "Checking BIOS password state..." -Type 1 -Info $MyInvocation
+    
+                    $TestAuth = Set-BiosPassword -OldPasswords $DefaultPwd -NewPassword $DefaultPwd
+    
+                    if ($TestAuth.IsError) {
+                        Write-Log -Message "Current password is OldPwd, changing to DefaultPwd..." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
+        
+                        if ($RtnSetPassword.IsError) {
+                            Write-Log -Message "The PW is Unknown so could not change" -Type 2 -Info $MyInvocation
+                            Set-ItemProperty -Path $RegPath -Name "PasswordFailed" -Value 1 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -Value 0 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String
+                            exit $Script:ERR_SUCCESS
+                        } else {
+                            Write-Log -Message "Successfully changed the BIOS/UEFI password." -Type 1 -Info $MyInvocation
+                            Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
+                        }
                     } else {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 1 -Info $MyInvocation
+                        Write-Log -Message "BIOS password already set correctly - no changes needed." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = $TestAuth
                     }
                 }
 
@@ -782,13 +898,31 @@ PROCESS
                 #region --- Set BIOS Password
 
                 if ($Phase -ne "WIN") {
-                    Write-Log -Message "Try to set the default BIOS password." -Type 1 -Info $MyInvocation
-                    $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
 
-                    if ($RtnSetPassword.IsError) {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 2 -Info $MyInvocation
+                $RegPath = "HKLM:\SOFTWARE\Intune\BIOSScript"
+                if (!(Test-Path $RegPath)) { New-Item -Path $RegPath -Force | Out-Null }
+
+                    Write-Log -Message "Checking BIOS password state..." -Type 1 -Info $MyInvocation
+    
+                    $TestAuth = Set-BiosPassword -OldPasswords $DefaultPwd -NewPassword $DefaultPwd
+    
+                    if ($TestAuth.IsError) {
+                        Write-Log -Message "Current password is OldPwd, changing to DefaultPwd..." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = Set-BiosPassword -OldPasswords $OldPwd -NewPassword $DefaultPwd
+        
+                        if ($RtnSetPassword.IsError) {
+                            Write-Log -Message "The PW is Unknown so could not change" -Type 2 -Info $MyInvocation
+                            Set-ItemProperty -Path $RegPath -Name "PasswordFailed" -Value 1 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "BIOSPasswordSet" -Value 0 -Type DWORD
+                            Set-ItemProperty -Path $RegPath -Name "LastRunTime" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Type String
+                            exit $Script:ERR_SUCCESS
+                        } else {
+                            Write-Log -Message "Successfully changed the BIOS/UEFI password." -Type 1 -Info $MyInvocation
+                            Remove-ItemProperty -Path $RegPath -Name "PasswordFailed" -ErrorAction SilentlyContinue
+                        }
                     } else {
-                        Write-Log -Message $RtnSetPassword.LogEntry -Type 1 -Info $MyInvocation
+                        Write-Log -Message "BIOS password already set correctly - no changes needed." -Type 1 -Info $MyInvocation
+                        $RtnSetPassword = $TestAuth
                     }
                 }
 
